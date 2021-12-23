@@ -1,0 +1,752 @@
+---
+title: "Explaining Happiness"
+output: 
+  html_document:
+    toc: true
+    code_folding: "hide"
+    theme: readable    
+---
+
+
+```{r libraries, include=F}
+rm(list = ls())
+devtools::install_github("hadley/emo")
+library(emo)
+library(data.table)
+library(tidyverse)
+library(scales)
+library(glue)
+library(sf)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rgeos)
+library(showtext)
+library(ggsci)
+library(ggtext)
+library(mice)
+library(plotly)
+library(corrplot)
+library(caret)
+install.packages("mitml")
+library(mitml) 
+font_add_google("Poppins", "Poppins")
+font_add_google("Roboto Mono", "Roboto Mono")
+showtext_auto()
+
+
+theme_set(theme_light(base_size = 20, base_family = "Poppins") + 
+            theme(plot.title = element_text(size = 20),
+                  axis.text = element_text(size=16),
+                  legend.text = element_text(size = 14)))
+```
+
+
+**Welcome to another notebook!!**   
+The aim of this analysis is to see how we can use external datasources to interpret a variable of interest.  
+In particular, we will combine 2 Kaggle datasets and use the results to decompose the happiness index. 
+
+# 1. Time to meet our datasets
+
+## 1.1 World happiness report
+
+The first dataset we are going to use is the [World happiness report 2021](https://www.kaggle.com/ajaypalsinghlo/world-happiness-report-2021). The only information that we are going to use from this dataset is the Happiness index and the country. We will try to explain the index using additional datasets from Kaggle.
+
+```{r loading_happiness, echo=F, results='asis'}
+hap_dt = fread("../input/world-happiness-report-2021/world-happiness-report-2021.csv", select=c("Country name", "Ladder score"))
+setnames(hap_dt, c("Country name", "Ladder score"), c("Country", "Happiness"))
+
+knitr::kable(head(hap_dt))
+```
+
+<span style="color:black">First dataset loaded! `r emo::ji("check")` </span>
+
+## 1.2 World data
+
+The second dataset we are going to use is the [World data by country](https://www.kaggle.com/daniboy370/world-data-by-country-2020) dataset, which contains data by country for the following indicators:
+
+* GDP per capita
+* Population growth
+* Life expectancy	 
+* Median age	
+* Meat consumption	
+* Sex-ratio	
+* Suicide rate	
+* Urbanization	
+* Fertility rate	
+
+Each indicator has a corresponding file so we will put all of them together into a single dataframe.
+
+
+```{r loading_world_data, echo = F, results='asis'}
+# Putting together world data
+world_data_directory = "../input/world-data-by-country-2020/"
+
+for (file in list.files(world_data_directory)){
+    
+    # Reading data and removing duplicates
+    new_dt = fread(glue("{world_data_directory}{file}"))
+    new_dt[, country_counter := 1:.N, by = `ISO-code`]
+    new_dt = new_dt[country_counter == 1][, country_counter := NULL]
+        
+    if (!exists("world_dt")) {
+        world_dt = new_dt
+    } else {
+        world_dt = merge(world_dt, new_dt, on = "ISO-code", all=T)        
+    }    
+}
+
+knitr::kable(head(world_dt))
+```
+
+<span style="color:black">Looks good! `r emo::ji("check")`</span> 
+
+## 1.3 World health statistics
+
+The third dataset at our disposal is the [World health statistics](https://www.kaggle.com/utkarshxy/who-worldhealth-statistics-2020-complete), which contains again country indicator information in individual csv files. The structure of the files is not uniform here, so reading the files and putting them together is more complex. Feel free to have a look at the helper functions used!
+
+In terms of indicators, I chose to include the following:
+
+* HEALTHY_LIFE_EXP <span> &rarr;</span> Healthy life expectancy (HALE) at birth measured in years.
+* CCDR3070 <span> &rarr;</span> Probability of dying between the age of 30 and 70 from any of: cardiovascular disease, cancer, diabetes, or chronic respiratory disease.  
+* CHILD_MORT <span> &rarr;</span> Probability of children dying below the age of 5 per 1000 live births.  
+* ALCOHOL_AB <span> &rarr;</span> Total (recorded + unrecorded) alcohol per capita (15+) consumption.  
+* POISON_MORT <span> &rarr;</span> Mortality rate attributed to unintentional poisoning per 100,000 population.  
+* MATERNAL_MORT <span> &rarr;</span> Maternal mortality ratio per 100,000 births.  
+* TUBERC <span> &rarr;</span> Incidence of TB per 100,000 population per year.  
+* NTD <span> &rarr;</span> Reported number of people requiring interventions against NTDs.
+* ROADTRAFFIC_MORT <span> &rarr;</span> Estimated road traffic death rate per 100,000 population.  
+* UNIV_HEALTHCARE <span> &rarr;</span> UHC index of service coverage (SCI).     
+* MEDICS <span> &rarr;</span> Medical doctors per 10,000 population.  
+* DRINKING_WATER <span> &rarr;</span> Population using at least basic drinking water services (%), sanitation and hygiene.  
+* CLEAN_FUEL_TECH <span> &rarr;</span> Proportion of population with primary reliance on clean fuels and technologies (%).  
+
+
+```{r functions_health_data, include=F} 
+
+read_data <- function (file_name) {
+    fread(glue("{health_data_directory}{file_name}"))
+}
+
+get_latest_period <- function(dt) {
+    dt[, max_country_period := max(Period), by = Location][Period == max_country_period][, max_country_period := NULL]
+}
+
+concatenate_health_files <- function(file_cat_l, function_l) {
+    for (file_ind in 1:length(file_cat_l)){
+        file_cat = file_cat_l[[file_ind]]
+        file_function = function_l[[file_ind]]
+
+        for (file in 1:length(file_cat)){
+            new_dt = file_function(file_cat[file], names(file_cat[file]))
+            if (!exists("res_dt")) {
+                res_dt = new_dt
+            } else {
+                res_dt = merge(res_dt, new_dt, by = "Location", all=T)
+            }
+        }
+    }
+    #print(nrow(res_dt))
+    return(res_dt)
+}
+
+filter_conv <- function (file_name, var_name) {
+    dt = read_data(file_name)
+    dt = get_latest_period(dt)
+    res = dt[Dim1 == "Both sexes", .(Location, TEMP = as.numeric(gsub("^(.*)\\s.*", "\\1", `First Tooltip`)))]
+    setnames(res, "TEMP", var_name)
+    return(res)
+}
+
+conv <- function (file_name, var_name) {
+    dt = read_data(file_name)
+    dt = get_latest_period(dt)
+    res = dt[, .(Location, TEMP = as.numeric(gsub("^(.*)\\s.*", "\\1", `First Tooltip`)))]
+    setnames(res, "TEMP", var_name)
+    return(res)
+}
+
+sel <- function (file_name, var_name) {
+    dt = read_data(file_name)
+    dt = get_latest_period(dt)
+    res = dt[, .(Location, TEMP = `First Tooltip`)]
+    setnames(res, "TEMP", var_name)
+    return(res)
+}
+
+```
+
+```{r file_definitions, include=F}
+# Depending on the structure of the file, it needs to be processed by a different function
+# Here I define which files need to be processed by which function
+
+health_data_directory = "../input/who-worldhealth-statistics-2020-complete/"
+
+filter_conv_files = c("CCDR3070" = "30-70cancerChdEtc.csv",
+                    "CHILD_MORT" = "under5MortalityRate.csv",
+                    "ALCOHOL_AB" = "alcoholSubstanceAbuse.csv",
+                    "POISON_MORT" = "mortalityRatePoisoning.csv")
+                
+conv_files = c("MATERNAL_MORT" = "maternalMortalityRatio.csv", 
+                  "TUBERC" = "incedenceOfTuberculosis.csv")
+
+sel_files = c("NTD" = "interventionAgianstNTDs.csv",
+              "ROADTRAFFIC_MORT" = "roadTrafficDeaths.csv",
+              "UNIV_HEALTHCARE" = "uhcCoverage.csv",
+              "MEDICS" = "medicalDoctors.csv",
+              "DRINKING_WATER" = "basicDrinkingWaterServices.csv",
+              "CLEAN_FUEL_TECH" = "cleanFuelAndTech.csv")
+
+
+file_cat_l = list(filter_conv_files, conv_files, sel_files)
+function_l = list(filter_conv, conv, sel)
+
+```
+
+
+```{r loading_world_health, out.width="100%", echo = F}
+world_health_dt = concatenate_health_files(file_cat_l, function_l)
+setnames(world_health_dt, "Location", "Country")
+
+knitr::kable(head(world_health_dt[, .SD, .SDcols = 1:6]))
+```
+
+<span style="color:black">Took a bit longer but looks good as well! `r emo::ji("check")`</span>
+
+## 1.4 Merging the information by country
+
+All three datasets contain country information. While this is a great start, as you can imagine they do not match exactly in the names and therefore some interventions are required to align them.  
+Feel free to go through the code for extra details regarding the matching performed! 
+
+```{r matching_countries, echo=F}
+
+# Manual fixing countries
+hap_dt[Country == 'Taiwan Province of China', Country := "Taiwan"]
+hap_dt[Country == 'Hong Kong S.A.R. of China', Country := "Hong Kong"]
+hap_dt[Country == 'Congo (Brazzaville)', Country := "Republic of the Congo"]
+hap_dt[Country == 'Gambia', Country := "The Gambia"]
+hap_dt[Country == 'Palestinian Territories', Country := "Palestine"]
+hap_dt[Country == 'Swaziland', Country := "Eswatini"]
+
+# Manual fixes
+world_health_dt[Country == "Czechia", Country := "Czech Republic"]
+world_health_dt[Country == "Democratic People's Republic of Korea", Country := "North Korea"]
+world_health_dt[Country == "Republic of Korea", Country := "South Korea"]
+world_health_dt[Country == "Viet Nam", Country := "Vietnam"]
+world_health_dt[Country == "Côte d’Ivoire", Country := "Ivory Coast"]
+world_health_dt[Country == "The former Yugoslav Republic of Macedonia", Country:="North Macedonia"]
+world_health_dt[Country == "Gambia", Country := "The Gambia"]
+world_health_dt[Country == "Congo", Country := "Republic of the Congo"]
+
+
+missing_countries = hap_dt[!Country %in% world_health_dt$Country, Country]
+
+# Automatic fixes
+for (missing_country in missing_countries) {
+    world_health_dt[grepl(missing_country, Country), Country := missing_country]    
+}
+
+input_dt = merge(hap_dt, world_dt, by = "Country") %>% merge(world_health_dt, by = "Country")
+knitr::kable(head(input_dt[, .SD, .SDcols = 1:11]))
+```
+
+<span style="color:black">Bam! The datasets have been merged and we can start with the analysis `r emo::ji("fireworks")` </span>
+
+
+
+# 2. EDA
+
+## 2.1 Missing values
+
+### 2.1.1 Missing values by country
+
+
+```{r missing_by_country, out.width="100%", echo=F}
+top_missing_by_country = head(input_dt[, .(`Missing values`=sum(sapply(.SD, is.na))), by = Country][order(-`Missing values`)], 20)
+ggplot(top_missing_by_country, aes(x=reorder(Country, `Missing values`), y = `Missing values`, fill = ifelse(Country== "Palestine", "Prob", "Fine"))) +
+  geom_col() + 
+  coord_flip() +
+  scale_y_continuous(expand = expansion(add = 0.05)) + 
+  scale_fill_manual(values = c("Prob" = muted("red"), "Fine" = muted("green")), guide="none") +
+  theme(panel.grid = element_blank(),
+        plot.title = element_blank(),
+            legend.title = element_blank(),
+            axis.title.y = element_blank(), 
+            panel.border = element_blank(),
+            axis.line.x.bottom  = element_line(color = 'gray'),
+            axis.line.y.left  = element_line(color = 'gray'))
+
+
+```
+
+Clearly, there is not enough information for Palestine, therefore I will exclude it from further analysis.
+
+### 2.1.2 Missing values by variable
+
+
+```{r missing_by_variable, out.width="100%", echo=F}
+input_dt = input_dt[Country != "Palestine"]
+
+missing_by_var = input_dt[, sapply(.SD, function(x) sum(is.na(x))/ length(x))]
+missing_by_var_dt = data.table(variable = names(missing_by_var), `Missing %` = missing_by_var)[`Missing %` > 0]
+
+ggplot(missing_by_var_dt, aes(x=reorder(variable, `Missing %`), y=`Missing %`)) +
+  geom_col(fill= "blue", width=0.75) +
+  coord_flip() + 
+  scale_y_continuous(expand = expansion(add = 0), labels = percent) + 
+  theme(panel.grid = element_blank(),
+            legend.title = element_blank(),
+            axis.title.y = element_blank(), 
+            panel.border = element_blank(),
+            axis.line.x.bottom  = element_line(color = 'gray'),
+            axis.line.y.left  = element_line(color = 'gray'))
+
+
+
+```
+
+Child mortality is the highest with around 12% of the available values missing, but besides that the rest of the variables are very well populated.
+
+## 2.2 Exploring happiness
+
+### 2.2.1 World view
+
+```{r world_hap_prep, dpi=100, include = F}
+world = ne_countries(scale = "medium", returnclass = "sf")
+
+hap_world = merge(world, input_dt[, .(`ISO-code`, Happiness)], by.x="adm0_a3", by.y="ISO-code", all.x=T)
+
+input_dt[data.table(world[c("continent", "adm0_a3")]), on = c(`ISO-code` = "adm0_a3"), Continent := i.continent]
+input_dt[Country == "Maldives", Continent := "Asia"]
+input_dt[Country == "Mauritius", Continent := "Africa"]
+input_dt[Continent %in% c("Asia", "Oceania"), Continent := "Asia & Oceania"]
+
+```
+
+
+```{r world_hap_plot, out.width="100%", echo=F}
+
+
+min_hap = min(hap_world$Happiness, na.rm = T)
+max_hap = max(hap_world$Happiness, na.rm = T)
+mid_hap = (min_hap + max_hap)/2
+my_breaks = c(min_hap, mid_hap, max_hap)
+labels = c("Unhappy", "Average", "Happy")
+
+ggplot(data = hap_world) + 
+  geom_sf(aes(fill=Happiness)) +
+  scale_fill_gradient2(low="blue", mid="beige", high="green3", 
+                       midpoint = mid_hap, 
+                       breaks = my_breaks,
+                       labels = labels) +
+  guides(fill = guide_colorbar(title.position = "top",
+                               title.hjust = .5,
+                               ticks.colour = "white",
+                               frame.colour = "black",
+                               barwidth = unit(20, "lines"),
+                               barheight = unit(.5, "lines"))) +
+  labs(title = 'World happiness index 2021') +
+  theme(plot.title = element_markdown(hjust= 0.5),
+        panel.grid = element_blank(),
+        legend.title = element_text(colour = "white"),
+        legend.box.margin = margin(-10,0,0,0),
+        legend.margin = margin(-10,0,0,0),
+        #plot.title = element_text(colour = "white"),
+        legend.position = "bottom")
+  
+```
+
+We can see that on average North America, Europe and Australia appear to be the happiest. But in order to compare across Continents we need a better chart. Luckily, I got you covered:
+
+### 2.2.2 Happiness by Continent
+
+
+```{r cont_hap_plot, out.width="100%", echo=F}
+input_dt[, Continent := fct_reorder(Continent, Happiness)]
+
+cont_dt = input_dt[, c("Country", "Continent", "Happiness")]
+#cont_dt = as.data.table(cont_dt)[, geometry := NULL][!is.na(Happiness)]
+
+cont_dt[, region_hap := mean(Happiness), by = Continent]
+
+dystopia_score = 2.43
+
+world_hap_avg = cont_dt[, mean(Happiness)]
+
+set.seed(1)
+hap = ggplot(cont_dt, aes(x = Continent, y = Happiness, color = Continent)) +
+      geom_jitter(size = 2, alpha = 0.45, width = 0.2) +
+      stat_summary(fun = mean, geom = "point", size = 5) +
+      geom_hline(aes(yintercept = world_hap_avg), color = "gray70", size = 0.6) +
+      geom_segment(
+        aes(x = Continent, xend = Continent,
+            y = world_hap_avg, yend = region_hap),
+        size = 0.8
+      ) +
+      coord_flip() +
+      scale_y_continuous(limits = c(dystopia_score, 8), expand = c(0.005, 0.005)) +
+        scale_color_uchicago() +
+        labs(x = NULL, y = "Happiness index") +
+        theme(
+          legend.position = "none",
+          #axis.title = element_text(size = 18),
+          axis.text = element_text(family = "Roboto Mono"), #size = 16),
+          panel.grid = element_blank()
+        )
+ 
+hap_text = hap +
+  annotate(
+    "text", x = 4.3, y = 4.8, family = "Poppins", size = 6, color = "gray20", lineheight = .5,
+    label = glue::glue("Worldwide\n average:{round(world_hap_avg, 1)}")) +
+  annotate(
+    "text", x = 3, y = 7.3, family = "Poppins", size = 6, color = "gray20", lineheight = .5,
+    label = "Continental\n average") +
+  annotate(
+    "text", x = 4.4, y = 3.1, family = "Poppins", size = 6, color = "gray20", lineheight = .9,
+    label = "Haiti") +
+  annotate(
+    "text", x = 2.6, y = 3, family = "Poppins", size = 6, color = "gray20", lineheight = .9,
+    label = "Afghanistan")
+  
+arrows <-
+  tibble(
+    x1 = c(4, 3, 3, 4.4, 2.5),
+    x2 = c(3.5, 3.8, 3, 3.9, 2),
+    y1 = c(4.8, 7, 7, 3.3, 3),
+    y2 = c(world_hap_avg, 6.2, 6, 3.6, 2.6)
+  )
+
+hap_text +
+  geom_curve(
+    data = arrows, aes(x = x1, y = y1, xend = x2, yend = y2),
+    arrow = arrow(length = unit(0.07, "inch")), size = 1,
+    color = "gray20", curvature = -0.3
+  )  
+  
+
+```
+
+### 2.2.3 Happiness and GDP
+
+```{r happiness_GDP, out.width="100%", echo=F}
+
+hap_gdp_dt = input_dt[, .(Country, `GDP per capita`, Happiness, Continent)]
+
+
+
+hap_gdp_plot = ggplot(hap_gdp_dt, aes(x=`GDP per capita`, y = Happiness, label=Country)) +
+                      geom_point(aes(color=Continent), alpha = 0.6, size = 2) +
+                      stat_smooth(method = "lm", se = T, formula = y ~ x + I(x^2),
+                                   color = "grey20", size = 0.8) +
+                      scale_x_continuous(labels = comma) +
+                      scale_color_uchicago() +
+                      labs(x = "GDP per capita ($)") +
+                      theme(panel.grid = element_blank(),
+                            legend.position = "top",
+                            legend.title=element_blank())
+
+ggplotly(hap_gdp_plot) %>% 
+  layout(legend = list(orientation = "h", title="", y=4))
+
+```
+
+In the chart you can see the line that I thought best fit the relationship. It turns out that higher GDP does coincide with higher happiness but the relationship stops being linear above certain values.
+
+### 2.2.4 Happiness and meat consumption
+
+
+```{r happiness_meat, out.width="100%", echo=F, warning=FALSE}
+hap_meat_dt = input_dt[, .(Country, `Meat consumption`, Happiness, Continent)]
+
+hap_meat_plot = ggplot(hap_meat_dt, aes(x=`Meat consumption`, y = Happiness, label=Country )) +
+  geom_point(aes(color=Continent), alpha = 0.6, size = 2) +
+  stat_smooth(method = "lm", se = T, formula=y~x,
+               color = "grey20", size = 0.8) +
+  scale_x_continuous(labels = comma) +
+  scale_color_uchicago() +
+  labs(x = "Meat consumption per capita (kg annually)") +
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        panel.grid = element_blank())
+
+
+ggplotly(hap_meat_plot) %>% 
+  layout(legend = list(orientation = "h", title="", y=4))
+
+
+```
+
+Ok the results are in, eating meat makes people happy, bring in the forks and knives!`r emo::ji("knife")`   
+In reality, what we are seeing is most likely due to the fact that in order to be able to afford eating meat at a higher volume, most likely the country's income is relatively high or the food availability is generally higher.  
+**These plots simply show correlation and nothing else!!**
+
+
+### 2.2.5 Happiness and child mortality
+
+```{r happiness_ch_mort, out.width="100%", echo=F, warning=FALSE}
+
+hap_chmort_dt = input_dt[, .(Country, CHILD_MORT, Happiness, Continent)]
+
+hap_chmort_plot = ggplot(hap_chmort_dt, aes(x=CHILD_MORT, y = Happiness, label=Country )) +
+  geom_point(aes(color=Continent), alpha = 0.6, size = 2) +
+  stat_smooth(method = "lm", se = T, formula=y~ x,
+               color = "grey20", size = 0.8) +
+  scale_x_continuous(labels = comma) +
+  scale_color_uchicago() +
+  labs(x = "Child mortality (per 1,000 births)") +
+  theme(legend.position = "top",
+        legend.title = element_blank(),
+        panel.grid = element_blank())
+
+
+ggplotly(hap_chmort_plot) %>% 
+  layout(legend = list(orientation = "h", title="", y=4))
+
+
+```
+
+Child mortality is a really terrible thing to happen. We can clearly see in the chart that the higher the figure the less happy the country tends to be. It is especially unfortunate to notice that the countries on the right hand side of the chart are predominantly from Africa.  
+
+## 2.3 Exploring variable correlation
+
+The plan for this notebook is to use linear regression (spoiler alert!), the grandfather `r emo::ji("old")` of all the modelling techniques, to model happiness. It is a very old-fashioned technique but it is very easy to interpret.  
+Unfortunately, contrary to newer tools it does not play well with correlated predictors so let's start by assessing correlations in the dataset.
+
+```{r variable_corr, dpi=100, out.width="100%", echo=F}
+
+descrCor = cor(input_dt[, -c("Country", "ISO-code", "Continent", "Happiness")], use="complete.obs")
+corrplot(descrCor, order = 'AOE', type = 'upper', tl.col="black")
+
+```
+
+From the correlogram it appears that there are plenty of highly correlated variables in the dataset. This is something we need to address for a linear regression model. 
+
+# 3. Modelling 
+
+## 3.1 Dataset preparation
+
+### 3.1.1 Standardizing the variables
+
+Since we are going to use linear regression, it is important that we standardize the variables and we can do that by using the `scale` function.
+
+```{r scaling}
+model_dt = copy(input_dt)
+model_dt = model_dt[, -"ISO-code"]
+num_vals = unlist(lapply(model_dt, is.numeric))
+
+num_cols = setdiff(names(num_vals)[num_vals==T], "Happiness")
+model_dt[, (num_cols) := lapply(.SD, scale), .SDcols=num_cols]
+
+print(paste("All numeric means are 0:", all(model_dt[, sapply(.SD, function(x) round(mean(x, na.rm=T),2)), .SDcols = num_cols] == 0)))
+print(paste("All numeric standard deviations are 1:", all(model_dt[, sapply(.SD, function(x) round(sd(x, na.rm=T),2)), .SDcols = num_cols] == 1)))
+
+```
+
+### 3.1.2 Multiple imputation with `mice` 
+
+As we have seen before, there are missing values in the dataset. In order to deal with them, we are going to make use of the `mice` package which offers the possibility for multiple imputation. Let's first have a better picture of the missing values in the data:
+
+```{r missingness_plot, dpi=100, out.width="100%", echo=F}
+t = md.pattern(model_dt[, -c("Country")], rotate.names = T)
+```
+
+The missingness pattern chart is very informative about where we have the missing values, but it might require some explanation as to how to read it:
+
+* Each row indicates a pattern (for example the second row corresponds to dataset rows where only the CHILD_MORT variable is missing) and a number on the left with how many such rows exist in the dataset (there are 15 rows in the dataset where only the CHILD_MORT variable is missing)  
+* The columns indicate missingness by variable, for example there are 4 observations that do not have the Life expectency variable filled in.
+* The column on the right counts the total rows in the dataset where we have at least one missing variable (in our case 38)
+
+The idea behind `mice` is to produce multiple imputed datasets, apply the analysis that we want to perform on them and then pool the results. **Please note that we are not going to use one dataset for the analysis, we are going to pool all the (10) imputed datasets**
+
+The imputation that I chose is the `cart` one which uses classification and regression trees. For more information, have a look [here](https://stefvanbuuren.name/fimd/sec-cart.html).
+To see whether the imputation values look plausible we can plot them together with the original dataset. 
+
+```{r imputated_values, dpi=100, out.width="100%", echo=F}
+
+names(model_dt) = make.names(names(model_dt))
+imp = mice(model_dt[, -c("Country")], printFlag = F, method="cart")
+
+stripplot(imp, Fertility + Life.expectancy + Meat.consumption + Median.age + 
+    Urbanization.rate + CHILD_MORT + ROADTRAFFIC_MORT + 
+    CLEAN_FUEL_TECH ~ .imp, pch=20, cex=2, alpha=0.7, main="Imputed values by variable and imputation number", strip=strip.custom( par.strip.text=list(cex=1.5)), scales=list(cex=1.5, relation="free"), xlab=list(cex = 2, label = "Imputation number"))
+
+imp = mice(model_dt[, -c("Country")], printFlag = F, method="cart", m=10, seed=1)
+
+```
+
+Imputation number 1 is the original dataset and therefore does not contain any red points. All the imputed values look plausible given the range of the dataset.
+
+For the actual computation, I increased the number of imputations from 5 to 10 in order to have a more robust analysis. This requires only changing one parameter in the mice formula.
+
+
+## 3.2 Variable selection with multiple imputation
+
+Our dataset contains a lot of variables. It would be great if we could narrow down the model to the few most crucial ones. To do so, we will use the `step` function. The intuition behind the model selection is the following:
+
+For each of the 10 imputed datasets:  
+1. Start with an empty model  
+2. Do stepwise forward selection based on [AIC](https://en.wikipedia.org/wiki/Akaike_information_criterion)  
+3. Select only the variables that appear in the majority of the imputed datasets  
+
+Let's see that in practice
+
+```{r var_selection, include=F}
+# Defining empty and full model
+scope = list(upper = ~ Fertility + GDP.per.capita + Life.expectancy + Meat.consumption + Median.age + Population.growth + Sex.ratio + Suicide.rate + Urbanization.rate + CCDR3070 + CHILD_MORT + ALCOHOL_AB + POISON_MORT + MATERNAL_MORT + TUBERC + NTD + ROADTRAFFIC_MORT + UNIV_HEALTHCARE + MEDICS + DRINKING_WATER + CLEAN_FUEL_TECH + Continent,
+              lower = ~1)
+expr = expression(f1 <- lm(Happiness ~ 1),
+                  f2 <- step(f1, scope = scope, direction = "forward"))
+fit = with(imp, expr)
+
+formulas = lapply(fit$analyses, formula)
+terms = lapply(formulas, terms)
+votes = unlist(lapply(terms, labels))
+```
+```{r variable_sel_plot, out.width="100%", echo=F}
+
+votes_dt = data.table(table(votes))
+votes_dt[, votes := fct_reorder(votes, N)]
+votes_dt[N==10, fill := "Incl"]
+votes_dt[N<5, fill := "Excl"]
+votes_dt[is.na(fill), fill := "Checked"]
+
+ggplot(votes_dt, aes(y = votes, x=N, fill = fill)) +
+  geom_col() +
+  scale_x_continuous(expand = expansion(add = 0.05), breaks = seq(2,10,2)) + 
+  scale_fill_manual(guide = "none", values = c("Incl" = muted("green"), "Excl"="darkgrey", "Checked"="lightblue")) +
+  labs(title="Variable selection accross multiple imputations", x="Models that included the variable") +
+  theme(panel.grid = element_blank(),
+        legend.title = element_blank(),
+        axis.title.y = element_blank(), 
+        panel.border = element_blank(),
+        axis.line.x.bottom  = element_line(color = 'gray'),
+        axis.line.y.left  = element_line(color = 'gray'))
+
+```
+
+From the plot it becomes clear that 7 variables are selected in every model that we trained and therefore should be included in the final model. For variables that are selected in 
+above 50% of the cases we can investigate whether they will benefit the model by using a multivariate Wald test (More information [here](https://www.gerkovink.com/miceVignettes/Combining_inferences/Combining_inferences.html#stepwise_modeling)).
+
+Another way of assessing whether the variable should be included or not is to compare the BIC scores in the two scenarios (where the variable is included or not). 
+Lower BIC score means better model. The results look as follows:
+
+```{r variable_checking, echo=F}
+simple_model_formula = "Happiness ~ ROADTRAFFIC_MORT + Meat.consumption + Life.expectancy + GDP.per.capita + DRINKING_WATER + Continent + CCDR3070"
+
+simple_fit = with(imp, do.call("lm", list(as.formula(simple_model_formula))))
+simple_bic = simple_fit$analyses %>% sapply(BIC)
+
+to_be_checked_vars = votes_dt[between(N, 6, 9), as.character(votes)]
+
+p_values = numeric()
+bic_imp = numeric()
+
+for (checked_var in to_be_checked_vars) {
+  
+  new_model_formula = paste(simple_model_formula, checked_var, sep = "+")
+  checked_fit = with(imp, do.call("lm", list(as.formula(new_model_formula))))
+  p_values = c(p_values, round(D1(checked_fit, simple_fit)$result[[4]], 3))
+  checked_bic =  checked_fit$analyses %>% sapply(BIC)
+  bic_imp = c(bic_imp, sum(checked_bic < simple_bic))
+}
+
+res = data.table(`Checked variables` = to_be_checked_vars, `P values` = p_values, `Cases where the model improved (BIC)` = bic_imp)
+
+knitr::kable(res)
+
+```
+
+<span style="color:black"> It becomes clear that there is no added benefit in including any of the other variables in the model and therefore we proceed with the original 7. </span>
+
+## 3.3 Fitting the linear regression model
+
+
+```{r model_fitting, class.source = 'fold-show'}
+simple_model_formula = "Happiness ~ ROADTRAFFIC_MORT + Meat.consumption + Life.expectancy + GDP.per.capita + DRINKING_WATER + Continent + CCDR3070"
+
+simple_fit = with(imp, do.call("lm", list(as.formula(simple_model_formula))))
+
+est = pool(simple_fit)
+sum_pool = summary(est, conf.int=T)
+
+```
+
+### 3.3.1 How much of the variance in the data did the model explain?
+
+The specified model explains `r round(100*pool.r.squared(est, adjusted=T)[[1]], 2)`% of the variance in the data.
+
+### 3.3.2 How do the coefficients look?
+
+```{r predictor_plot, out.width = "100%", echo=F}
+
+coef_dt = data.table(Variable = sum_pool$term, Estimate = sum_pool$estimate, Lower = sum_pool$`2.5 %`, Upper = sum_pool$`97.5 %`)
+coef_dt = coef_dt[-1]
+
+ggplot(coef_dt, aes(y = Variable, color = Variable)) +
+  geom_point(aes(x=Estimate), size=3) +
+  geom_segment(aes(x = Lower, xend = Upper, yend=Variable), size = 1) +
+  geom_vline(aes(xintercept = 0)) +
+  labs(title = "Predictor estimates and 95% confidence intervals") +
+  theme(panel.grid = element_blank(),
+        legend.position = "none",
+        axis.title.y = element_blank(), 
+        panel.border = element_blank(),
+        axis.line.x.bottom  = element_line(color = 'gray'),
+        axis.line.y.left  = element_line(color = 'gray'))
+
+
+
+```
+
+### 3.3.3 Coefficient interpretation
+
+As always, let's start with the standard disclaimer: <span style="color:red"> The model we have developed can indicate a relationship between the predictors and happiness but not causality</span> 
+
+
+That being said, what kinds of associations are there?  
+
+**Positive relationship**
+
+Happiness has a positive relationship with the following variables:
+
+* GDP per capita
+* Population using at least basic drinking water services (%), sanitation and hygiene.(DRINKING_WATER)  
+* Meat consumption 
+
+All three of these results look plausible to me, as they are all factors that improve the level of life in a country.
+
+**Negative relationship**
+
+Happiness has a negative relationship with the following variables:
+
+* Road traffic mortality  
+* Probability of dying between the age of 30 and 70 from any of: cardiovascular disease, cancer, diabetes, or chronic respiratory disease.(CCDR3070)
+
+Again here the results appear normal as both of these variables describe events with negative impact on society.
+
+**Murky**
+
+The relationship between happiness and life expectency is tricky. While the estimate is negative (`r round(coef_dt[Variable == "Life.expectancy", Estimate],2)`), we can see from the confidence interval that 0 and positive values are also included. 
+
+**How about the continents?**
+
+The continent variable is a factor with 5 levels (Europe, North America, South America, Asia & Oceania, Africa).  
+If you look at the previous plot carefully, you will notice that there is no Continent Africa variable.  
+This indicates that Africa is used as a baseline and the coefficients for the other 4 choices can be interpreted as the difference in average happiness between that continent and Africa (with all other variables being equal). So for example, the average happiness difference between a country in North America compared to Africa is `r round(coef_dt[Variable == "ContinentNorth America", Estimate], 2)` (with all other variables being equal).
+
+# Further resources
+
+* [An Introduction to Statistical Learning](https://hastie.su.domains/ISLR2/ISLRv2_website.pdf)
+* [mice CRAN](https://cran.r-project.org/web/packages/mice/mice.pdf)
+* [mice vignettes](https://www.gerkovink.com/miceVignettes/)
+
+# Other of my notebooks that you (hopefully!) might enjoy
+
+* [Exploring Isolation Forests and survey data](https://www.kaggle.com/noobiedatascientist/isolation-forest-and-eda)
+* [Selecting features in the NBA](https://www.kaggle.com/noobiedatascientist/feature-selection-in-the-nba)
+* [Understanding convolutional neural networks with Grad-CAM](https://www.kaggle.com/noobiedatascientist/getting-hooked-with-pytorch-and-grad-cam)
+
+If you enjoyed this notebook, liked the visualisations, have questions/suggestions or comments please let me know!! And if you feel like it, give it an upvote 😊😊✨✨
+
+
+
+
