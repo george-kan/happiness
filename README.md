@@ -1,6 +1,6 @@
 # Explaining happiness 🤗
 Explaining the world happiness index through country specific information
-
+https://www.kaggle.com/noobiedatascientist/explaining-happiness
 
 Kaggle notebook in R showcasing how to analyse a dataset and use vanilla linear regression for inference.
 
